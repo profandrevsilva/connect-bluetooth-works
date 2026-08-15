@@ -8,55 +8,64 @@
 #include <BLEClient.h>
 #include <BLERemoteCharacteristic.h>
 #include <BLERemoteService.h>
-#include <BLERemoteDescriptor.h>
 
 // =====================================================
 // WIFI
 // =====================================================
 
-const char* ssid = "andre";
-const char* password = "@Nd16727316";
-
-// =====================================================
-// WEB SERVER
-// =====================================================
+const char* WIFI_SSID = "andre";
+const char* WIFI_PASSWORD = "@Nd16727316";
 
 WebServer server(80);
 
 // =====================================================
-// MICRO:BIT
+// MICRO:BIT IDENTIFICATION
 // =====================================================
 
 const char* MICROBIT_NAME_PREFIX = "BBC micro:bit";
+
+const char* MICROBIT_ADDRESSES[] = {
+    "fb:fe:84:0d:e5:45"
+};
+
+const int MICROBIT_ADDRESS_COUNT =
+    sizeof(MICROBIT_ADDRESSES) /
+    sizeof(MICROBIT_ADDRESSES[0]);
 
 // =====================================================
 // NORDIC UART SERVICE
 // =====================================================
 
-// NUS Service
-static BLEUUID UART_SERVICE_UUID(
+static BLEUUID NUS_SERVICE(
     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 );
 
-// micro:bit -> ESP32
-// NUS TX characteristic
-static BLEUUID UART_RX_UUID(
+// =====================================================
+// MICRO:BIT -> ESP32
+//
+// NUS TX characteristic from micro:bit perspective
+// UUID:
+// 6E400003-B5A3-F393-E0A9-E50E24DCCA9E
+//
+// ESP32 receives notifications here.
+// =====================================================
+
+static BLEUUID NUS_RX(
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 );
 
-// ESP32 -> micro:bit
-// NUS RX characteristic
-static BLEUUID UART_TX_UUID(
+// =====================================================
+// ESP32 -> MICRO:BIT
+//
+// NUS RX characteristic from micro:bit perspective
+// =====================================================
+
+static BLEUUID NUS_TX(
     "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 );
 
-// Client Characteristic Configuration Descriptor
-static BLEUUID CCCD_UUID(
-    (uint16_t)0x2902
-);
-
 // =====================================================
-// SENSOR
+// SENSOR DATA
 // =====================================================
 
 float temperature = 0.0;
@@ -64,7 +73,7 @@ float humidity = 0.0;
 
 bool dataReceived = false;
 
-unsigned long lastTemperatureTime = 0;
+unsigned long lastDataTime = 0;
 
 const unsigned long DATA_TIMEOUT = 10000;
 
@@ -72,65 +81,61 @@ const unsigned long DATA_TIMEOUT = 10000;
 // BLE
 // =====================================================
 
-BLEClient* bleClient = nullptr;
+BLEClient* client = nullptr;
 
 BLERemoteCharacteristic* rxCharacteristic = nullptr;
 BLERemoteCharacteristic* txCharacteristic = nullptr;
 
 bool bleConnected = false;
 
-String microbitAddress = "<unknown>";
-String microbitName = "<unknown>";
+String connectedName = "";
+String connectedAddress = "";
 
-String receivedData = "";
+String rxBuffer = "";
 
-unsigned long lastBLERetry = 0;
+unsigned long lastReconnect = 0;
 
-const unsigned long BLE_RETRY_INTERVAL = 5000;
+const unsigned long RECONNECT_INTERVAL = 5000;
 
 // =====================================================
 // FORWARD DECLARATIONS
 // =====================================================
 
-void cleanupBLEConnection();
+void scanAndConnect();
 
-bool connectToMicrobit();
-
-bool connectAndVerifyNUS(
+bool connectToDevice(
     BLEAdvertisedDevice* device
 );
 
-bool enableNotifications();
-
-bool sendToMicrobit(
-    const String& message
-);
-
-bool sendConnectionBeep();
-
-void notifyCallback(
+void notificationCallback(
     BLERemoteCharacteristic* characteristic,
     uint8_t* data,
     size_t length,
     bool isNotify
 );
 
+bool isAllowedMicrobit(
+    BLEAdvertisedDevice& device
+);
+
+bool isAllowedAddress(
+    String address
+);
+
+void cleanupConnection();
+
 void handleRoot();
-void handleAPIData();
+void handleAPI();
 void handleStatus();
-void handleBeep();
-void handleFavicon();
-
-String makeHTML();
 
 // =====================================================
-// BLE CLIENT CALLBACK
+// BLE CLIENT CALLBACKS
 // =====================================================
 
-class MyClientCallback : public BLEClientCallbacks {
+class ClientCallbacks : public BLEClientCallbacks {
 
     void onConnect(
-        BLEClient* client
+        BLEClient* pClient
     ) override {
 
         Serial.println();
@@ -140,12 +145,12 @@ class MyClientCallback : public BLEClientCallbacks {
     }
 
     void onDisconnect(
-        BLEClient* client
+        BLEClient* pClient
     ) override {
 
         Serial.println();
         Serial.println(
-            "BLE: !!! CLIENT DISCONNECTED !!!"
+            "BLE: !!! MICRO:BIT DISCONNECTED !!!"
         );
 
         bleConnected = false;
@@ -153,121 +158,252 @@ class MyClientCallback : public BLEClientCallbacks {
         rxCharacteristic = nullptr;
         txCharacteristic = nullptr;
 
-        lastBLERetry = millis();
+        lastReconnect = millis();
     }
 };
 
 // =====================================================
-// NOTIFICATION CALLBACK
+// BLE NOTIFICATION CALLBACK
+// =====================================================
+//
+// This is the most important diagnostic function.
+//
+// Expected:
+//
+// TEMP:24
+//
+// or:
+//
+// TEMP:24\n
+//
 // =====================================================
 
-void notifyCallback(
+void notificationCallback(
     BLERemoteCharacteristic* characteristic,
     uint8_t* data,
     size_t length,
     bool isNotify
 ) {
 
-    String message = "";
+    Serial.println();
+    Serial.println(
+        "********************************"
+    );
+
+    Serial.println(
+        "BLE NOTIFICATION RECEIVED!"
+    );
+
+    Serial.print(
+        "Length: "
+    );
+
+    Serial.println(
+        length
+    );
+
+    // =================================================
+    // ASCII
+    // =================================================
+
+    Serial.print(
+        "ASCII: "
+    );
 
     for (
         size_t i = 0;
         i < length;
         i++
     ) {
-        message += (char)data[i];
+
+        char c =
+            (char)data[i];
+
+        if (
+            c >= 32 &&
+            c <= 126
+        ) {
+
+            Serial.print(c);
+
+        }
+        else {
+
+            if (c == '\n') {
+                Serial.print("\\n");
+            }
+            else if (c == '\r') {
+                Serial.print("\\r");
+            }
+            else {
+                Serial.print(".");
+            }
+        }
+    }
+
+    Serial.println();
+
+    // =================================================
+    // HEX
+    // =================================================
+
+    Serial.print(
+        "HEX: "
+    );
+
+    for (
+        size_t i = 0;
+        i < length;
+        i++
+    ) {
+
+        if (
+            data[i] < 16
+        ) {
+
+            Serial.print("0");
+        }
+
+        Serial.print(
+            data[i],
+            HEX
+        );
+
+        Serial.print(" ");
+    }
+
+    Serial.println();
+
+    // =================================================
+    // NOTIFICATION STATUS
+    // =================================================
+
+    Serial.print(
+        "isNotify: "
+    );
+
+    Serial.println(
+        isNotify
+        ? "YES"
+        : "NO"
+    );
+
+    // =================================================
+    // ADD TO BUFFER
+    // =================================================
+
+    for (
+        size_t i = 0;
+        i < length;
+        i++
+    ) {
+
+        rxBuffer +=
+            (char)data[i];
     }
 
     Serial.print(
-        "BLE RX: "
+        "RX BUFFER: "
     );
 
-    Serial.println(message);
-
-    receivedData += message;
-
-    // Prevent unlimited buffer growth
-    if (receivedData.length() > 2048) {
-
-        receivedData = "";
-
-        Serial.println(
-            "BLE RX: buffer cleared"
-        );
-    }
+    Serial.println(
+        rxBuffer
+    );
 
     // =================================================
     // PROCESS COMPLETE LINES
     // =================================================
 
-    int newlineIndex;
+    while (true) {
 
-    while (
-        (newlineIndex =
-            receivedData.indexOf('\n')) >= 0
-    ) {
+        int newline =
+            rxBuffer.indexOf('\n');
+
+        if (
+            newline < 0
+        ) {
+
+            break;
+        }
 
         String line =
-            receivedData.substring(
+            rxBuffer.substring(
                 0,
-                newlineIndex
+                newline
             );
 
-        receivedData.remove(
+        rxBuffer.remove(
             0,
-            newlineIndex + 1
+            newline + 1
         );
 
         line.trim();
 
-        if (line.length() == 0) {
+        if (
+            line.length() == 0
+        ) {
+
             continue;
         }
 
-        Serial.print(
-            "BLE MESSAGE: "
+        Serial.println();
+        Serial.println(
+            "================================"
         );
 
-        Serial.println(line);
+        Serial.print(
+            "MICRO:BIT MESSAGE: "
+        );
+
+        Serial.println(
+            line
+        );
+
+        Serial.println(
+            "================================"
+        );
 
         // =================================================
-        // TEMP
+        // TEMPERATURE
         // =================================================
 
-        int tempIndex =
+        int tempPos =
             line.indexOf("TEMP:");
 
-        if (tempIndex >= 0) {
+        if (
+            tempPos >= 0
+        ) {
 
-            int tempStart =
-                tempIndex + 5;
+            int start =
+                tempPos + 5;
 
-            int tempEnd =
+            int end =
                 line.indexOf(
                     ';',
-                    tempStart
+                    start
                 );
 
-            if (tempEnd < 0) {
-                tempEnd = line.length();
+            if (
+                end < 0
+            ) {
+
+                end =
+                    line.length();
             }
 
-            String tempString =
+            String value =
                 line.substring(
-                    tempStart,
-                    tempEnd
+                    start,
+                    end
                 );
 
+            value.trim();
+
             temperature =
-                tempString.toFloat();
-
-            lastTemperatureTime =
-                millis();
-
-            dataReceived = true;
+                value.toFloat();
 
             Serial.print(
-                "Temperature = "
+                "TEMPERATURE = "
             );
 
             Serial.print(
@@ -284,38 +420,46 @@ void notifyCallback(
         // HUMIDITY
         // =================================================
 
-        int humIndex =
+        int humPos =
             line.indexOf("HUM:");
 
-        if (humIndex >= 0) {
+        if (
+            humPos >= 0
+        ) {
 
-            int humStart =
-                humIndex + 4;
+            int start =
+                humPos + 4;
 
-            int humEnd =
+            int end =
                 line.length();
 
             int semicolon =
                 line.indexOf(
                     ';',
-                    humStart
+                    start
                 );
 
-            if (semicolon >= 0) {
-                humEnd = semicolon;
+            if (
+                semicolon >= 0
+            ) {
+
+                end =
+                    semicolon;
             }
 
-            String humString =
+            String value =
                 line.substring(
-                    humStart,
-                    humEnd
+                    start,
+                    end
                 );
 
+            value.trim();
+
             humidity =
-                humString.toFloat();
+                value.toFloat();
 
             Serial.print(
-                "Humidity = "
+                "HUMIDITY = "
             );
 
             Serial.print(
@@ -329,437 +473,154 @@ void notifyCallback(
         }
 
         // =================================================
-        // BEEP
+        // DATA RECEIVED
         // =================================================
 
-        if (line == "BEEP_OK") {
+        if (
+            line.indexOf("TEMP:") >= 0 ||
+            line.indexOf("HUM:") >= 0
+        ) {
+
+            dataReceived =
+                true;
+
+            lastDataTime =
+                millis();
+
+            Serial.println();
+            Serial.println(
+                ">>> SENSOR DATA RECEIVED <<<"
+            );
+
+            Serial.print(
+                "Temperature: "
+            );
+
+            Serial.print(
+                temperature,
+                1
+            );
 
             Serial.println(
-                "MICRO:BIT: BEEP_OK"
+                " C"
+            );
+
+            Serial.print(
+                "Humidity: "
+            );
+
+            Serial.print(
+                humidity,
+                1
+            );
+
+            Serial.println(
+                " %"
+            );
+
+            Serial.println(
+                "================================"
             );
         }
     }
+
+    // =================================================
+    // BUFFER PROTECTION
+    // =================================================
+
+    if (
+        rxBuffer.length() > 2048
+    ) {
+
+        Serial.println(
+            "BLE RX: buffer overflow - clearing"
+        );
+
+        rxBuffer = "";
+    }
+
+    Serial.println(
+        "********************************"
+    );
 }
 
 // =====================================================
-// ENABLE NOTIFICATIONS
-// =====================================================
-//
-// This is the important part.
-//
-// The old code did:
-//
-//     if (!rxCharacteristic->canNotify())
-//         reject;
-//
-// That caused:
-//
-//     RX cannot notify
-//
-// We do NOT reject the connection anymore.
-//
-// We first register the callback.
-// Then we explicitly try to enable the CCCD.
-//
+// CHECK ADDRESS
 // =====================================================
 
-bool enableNotifications()
-{
-    if (rxCharacteristic == nullptr) {
+bool isAllowedAddress(
+    String address
+) {
 
-        Serial.println(
-            "BLE ERROR: RX characteristic is NULL"
-        );
+    address.toLowerCase();
 
-        return false;
-    }
+    for (
+        int i = 0;
+        i < MICROBIT_ADDRESS_COUNT;
+        i++
+    ) {
 
-    Serial.println();
-    Serial.println(
-        "BLE: Configuring RX notifications..."
-    );
-
-    // =================================================
-    // REGISTER CALLBACK
-    // =================================================
-
-    rxCharacteristic->registerForNotify(
-        notifyCallback
-    );
-
-    Serial.println(
-        "BLE: Notification callback registered"
-    );
-
-    delay(200);
-
-    // =================================================
-    // FIND CCCD
-    // =================================================
-
-    BLERemoteDescriptor* cccd =
-        rxCharacteristic->getDescriptor(
-            CCCD_UUID
-        );
-
-    if (cccd != nullptr) {
-
-        Serial.println(
-            "BLE: CCCD descriptor found"
-        );
-
-        uint8_t notifyOn[2] =
-        {
-            0x01,
-            0x00
-        };
-
-        try {
-
-            cccd->writeValue(
-                notifyOn,
-                2,
-                true
+        String allowed =
+            String(
+                MICROBIT_ADDRESSES[i]
             );
 
-            Serial.println(
-                "BLE: CCCD notification ENABLED"
-            );
+        allowed.toLowerCase();
+
+        if (
+            address == allowed
+        ) {
 
             return true;
-
-        }
-        catch (...) {
-
-            Serial.println(
-                "BLE: CCCD write failed"
-            );
         }
     }
-    else {
-
-        Serial.println(
-            "BLE: CCCD descriptor not found"
-        );
-
-        Serial.println(
-            "BLE: Continuing with registered callback..."
-        );
-    }
-
-    // =================================================
-    // IMPORTANT:
-    //
-    // Do not disconnect simply because the old
-    // BLE library cannot retrieve the descriptor.
-    // =================================================
-
-    return true;
-}
-
-// =====================================================
-// SEND TO MICRO:BIT
-// =====================================================
-
-bool sendToMicrobit(
-    const String& message
-)
-{
-    if (
-        bleClient == nullptr
-    ) {
-
-        Serial.println(
-            "BLE TX: Client NULL"
-        );
-
-        return false;
-    }
-
-    if (
-        !bleClient->isConnected()
-    ) {
-
-        Serial.println(
-            "BLE TX: Not connected"
-        );
-
-        return false;
-    }
-
-    if (
-        txCharacteristic == nullptr
-    ) {
-
-        Serial.println(
-            "BLE TX: TX characteristic NULL"
-        );
-
-        return false;
-    }
-
-    Serial.print(
-        "BLE TX -> "
-    );
-
-    Serial.print(
-        message
-    );
-
-    Serial.println();
-
-    if (
-        txCharacteristic->canWrite()
-    ) {
-
-        txCharacteristic->writeValue(
-            (uint8_t*)message.c_str(),
-            message.length(),
-            false
-        );
-
-        Serial.println(
-            "BLE TX: sent"
-        );
-
-        return true;
-    }
-
-    if (
-        txCharacteristic->canWriteNoResponse()
-    ) {
-
-        txCharacteristic->writeValue(
-            (uint8_t*)message.c_str(),
-            message.length(),
-            true
-        );
-
-        Serial.println(
-            "BLE TX: sent without response"
-        );
-
-        return true;
-    }
-
-    Serial.println(
-        "BLE TX ERROR: Cannot write"
-    );
 
     return false;
 }
 
 // =====================================================
-// BEEP
+// CHECK MICRO:BIT
 // =====================================================
 
-bool sendConnectionBeep()
-{
-    if (!bleConnected) {
-
-        return false;
-    }
-
-    return sendToMicrobit(
-        "BEEP\n"
-    );
-}
-
-// =====================================================
-// CLEAN CONNECTION
-// =====================================================
-
-void cleanupBLEConnection()
-{
-    rxCharacteristic = nullptr;
-    txCharacteristic = nullptr;
-
-    if (
-        bleClient != nullptr
-    ) {
-
-        if (
-            bleClient->isConnected()
-        ) {
-
-            Serial.println(
-                "BLE: Disconnecting old connection..."
-            );
-
-            bleClient->disconnect();
-
-            delay(200);
-        }
-
-        delete bleClient;
-
-        bleClient = nullptr;
-    }
-
-    bleConnected = false;
-}
-
-// =====================================================
-// PRINT MANUFACTURER
-// =====================================================
-
-void printManufacturerData(
+bool isAllowedMicrobit(
     BLEAdvertisedDevice& device
-)
-{
-    if (
-        !device.haveManufacturerData()
-    ) {
+) {
 
-        Serial.println(
-            "Manufacturer: <none>"
-        );
-
-        return;
-    }
-
-    std::string data =
-        device.getManufacturerData();
-
-    Serial.print(
-        "Manufacturer: "
-    );
-
-    for (
-        size_t i = 0;
-        i < data.length();
-        i++
-    ) {
-
-        uint8_t b =
-            (uint8_t)data[i];
-
-        if (b < 16) {
-            Serial.print("0");
-        }
-
-        Serial.print(
-            b,
-            HEX
-        );
-
-        Serial.print(" ");
-    }
-
-    Serial.println();
-}
-
-// =====================================================
-// PRINT DEVICE
-// =====================================================
-
-void printBLEDevice(
-    BLEAdvertisedDevice& device,
-    int number
-)
-{
-    Serial.println();
-    Serial.println(
-        "--------------------------------"
-    );
-
-    Serial.print(
-        "DEVICE #"
-    );
-
-    Serial.println(
-        number
-    );
-
-    Serial.print(
-        "Address: "
-    );
-
-    Serial.println(
+    String address =
         device.getAddress()
             .toString()
-            .c_str()
-    );
+            .c_str();
 
-    Serial.print(
-        "RSSI: "
-    );
-
-    Serial.print(
-        device.getRSSI()
-    );
-
-    Serial.println(
-        " dBm"
-    );
+    String name = "";
 
     if (
         device.haveName()
     ) {
 
-        Serial.print(
-            "Name: "
-        );
-
-        Serial.println(
+        name =
             device.getName()
-                .c_str()
-        );
+                .c_str();
     }
-    else {
-
-        Serial.println(
-            "Name: <none>"
-        );
-    }
-
-    if (
-        device.haveServiceUUID()
-    ) {
-
-        Serial.print(
-            "Service UUID: "
-        );
-
-        Serial.println(
-            device.getServiceUUID()
-                .toString()
-                .c_str()
-        );
-    }
-    else {
-
-        Serial.println(
-            "Service UUID: <none>"
-        );
-    }
-
-    printManufacturerData(
-        device
-    );
-}
-
-// =====================================================
-// CHECK MICRO:BIT NAME
-// =====================================================
-
-bool isMicrobitDevice(
-    BLEAdvertisedDevice& device
-)
-{
-    if (!device.haveName()) {
-
-        return false;
-    }
-
-    String name =
-        device.getName().c_str();
 
     Serial.print(
-        "Checking device name: "
+        "Checking device: "
     );
 
-    Serial.println(name);
+    Serial.print(
+        name
+    );
+
+    Serial.print(
+        " / "
+    );
+
+    Serial.println(
+        address
+    );
+
+    // =================================================
+    // NAME
+    // =================================================
 
     if (
         name.startsWith(
@@ -774,18 +635,38 @@ bool isMicrobitDevice(
         return true;
     }
 
+    // =================================================
+    // ADDRESS
+    // =================================================
+
+    if (
+        isAllowedAddress(
+            address
+        )
+    ) {
+
+        Serial.println(
+            ">>> MICRO:BIT ADDRESS MATCH <<<"
+        );
+
+        return true;
+    }
+
     return false;
 }
 
 // =====================================================
-// CONNECT AND VERIFY NUS
+// CONNECT TO DEVICE
 // =====================================================
 
-bool connectAndVerifyNUS(
+bool connectToDevice(
     BLEAdvertisedDevice* device
-)
-{
-    if (device == nullptr) {
+) {
+
+    if (
+        device == nullptr
+    ) {
+
         return false;
     }
 
@@ -802,8 +683,33 @@ bool connectAndVerifyNUS(
         "================================"
     );
 
+    // =================================================
+    // DEVICE INFORMATION
+    // =================================================
+
     Serial.print(
-        "Address: "
+        "NAME: "
+    );
+
+    if (
+        device->haveName()
+    ) {
+
+        Serial.println(
+            device->getName()
+                .c_str()
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "<none>"
+        );
+    }
+
+    Serial.print(
+        "ADDRESS: "
     );
 
     Serial.println(
@@ -812,46 +718,32 @@ bool connectAndVerifyNUS(
             .c_str()
     );
 
-    if (
-        device->haveName()
-    ) {
-
-        Serial.print(
-            "Name: "
-        );
-
-        Serial.println(
-            device->getName()
-                .c_str()
-        );
-    }
-
     // =================================================
-    // CLEAN PREVIOUS CLIENT
+    // CLEAN OLD CONNECTION
     // =================================================
 
-    cleanupBLEConnection();
+    cleanupConnection();
 
     // =================================================
     // CREATE CLIENT
     // =================================================
 
-    bleClient =
+    client =
         BLEDevice::createClient();
 
     if (
-        bleClient == nullptr
+        client == nullptr
     ) {
 
         Serial.println(
-            "BLE ERROR: createClient failed"
+            "BLE ERROR: createClient() failed"
         );
 
         return false;
     }
 
-    bleClient->setClientCallbacks(
-        new MyClientCallback()
+    client->setClientCallbacks(
+        new ClientCallbacks()
     );
 
     // =================================================
@@ -863,14 +755,16 @@ bool connectAndVerifyNUS(
     );
 
     if (
-        !bleClient->connect(device)
+        !client->connect(
+            device
+        )
     ) {
 
         Serial.println(
-            "BLE ERROR: Connection failed"
+            "BLE ERROR: connect() failed"
         );
 
-        cleanupBLEConnection();
+        cleanupConnection();
 
         return false;
     }
@@ -879,35 +773,19 @@ bool connectAndVerifyNUS(
         "BLE: Physical connection OK"
     );
 
-    // =================================================
-    // SAVE DEVICE
-    // =================================================
-
-    microbitAddress =
-        device->getAddress()
-            .toString()
-            .c_str();
-
-    if (
-        device->haveName()
-    ) {
-
-        microbitName =
-            device->getName()
-                .c_str();
-    }
+    delay(300);
 
     // =================================================
-    // GET NUS
+    // NUS SERVICE
     // =================================================
 
     Serial.println(
-        "BLE: Looking for Nordic UART Service..."
+        "BLE: Searching NUS..."
     );
 
     BLERemoteService* service =
-        bleClient->getService(
-            UART_SERVICE_UUID
+        client->getService(
+            NUS_SERVICE
         );
 
     if (
@@ -915,10 +793,10 @@ bool connectAndVerifyNUS(
     ) {
 
         Serial.println(
-            "BLE ERROR: NUS NOT FOUND"
+            "BLE ERROR: NUS SERVICE NOT FOUND"
         );
 
-        cleanupBLEConnection();
+        cleanupConnection();
 
         return false;
     }
@@ -928,37 +806,72 @@ bool connectAndVerifyNUS(
     );
 
     // =================================================
-    // RX
+    // RX CHARACTERISTIC
     // =================================================
 
     Serial.println(
-        "BLE: Looking for RX..."
+        "BLE: Searching RX characteristic..."
     );
 
     rxCharacteristic =
         service->getCharacteristic(
-            UART_RX_UUID
+            NUS_RX
         );
+    
+    Serial.println();
+    Serial.println("========== RX CAPABILITIES ==========");
+
+    Serial.print("Can Read: ");
+    Serial.println(
+    rxCharacteristic->canRead()
+    ? "YES"
+    : "NO"
+    );
+
+    Serial.print("Can Write: ");
+    Serial.println(
+    rxCharacteristic->canWrite()
+    ? "YES"
+    : "NO"
+    );
+
+    Serial.print("Can Notify: ");
+    Serial.println(
+    rxCharacteristic->canNotify()
+    ? "YES"
+    : "NO"
+    );
+
+    Serial.print("Can Indicate: ");
+    Serial.println(
+    rxCharacteristic->canIndicate()
+    ? "YES"
+    : "NO"
+    );
+
+    Serial.println(
+    "====================================="
+    );
 
     if (
         rxCharacteristic == nullptr
     ) {
 
         Serial.println(
-            "BLE ERROR: RX NOT FOUND"
+            "BLE ERROR: RX CHARACTERISTIC NOT FOUND"
         );
 
-        cleanupBLEConnection();
+        cleanupConnection();
 
         return false;
     }
 
     Serial.println(
-        "BLE: RX characteristic FOUND"
+        "BLE: *** RX CHARACTERISTIC FOUND ***"
     );
 
     Serial.print(
-        "BLE: RX UUID: "
+        "BLE RX UUID: "
     );
 
     Serial.println(
@@ -968,93 +881,190 @@ bool connectAndVerifyNUS(
     );
 
     // =================================================
-    // NOTIFICATIONS
+    // CHECK PROPERTIES
     // =================================================
 
+    Serial.println();
+    Serial.println(
+        "BLE RX CHARACTERISTIC PROPERTIES:"
+    );
+
     if (
-        !enableNotifications()
+        rxCharacteristic->canNotify()
     ) {
 
         Serial.println(
-            "BLE ERROR: Notification setup failed"
+            "  NOTIFY: YES"
         );
 
-        cleanupBLEConnection();
+    }
+    else {
 
-        return false;
+        Serial.println(
+            "  NOTIFY: NO"
+        );
+    }
+
+    if (
+        rxCharacteristic->canIndicate()
+    ) {
+
+        Serial.println(
+            "  INDICATE: YES"
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "  INDICATE: NO"
+        );
+    }
+
+    if (
+        rxCharacteristic->canRead()
+    ) {
+
+        Serial.println(
+            "  READ: YES"
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "  READ: NO"
+        );
+    }
+
+    if (
+        rxCharacteristic->canWrite()
+    ) {
+
+        Serial.println(
+            "  WRITE: YES"
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "  WRITE: NO"
+        );
     }
 
     // =================================================
-    // TX
+    // REGISTER NOTIFICATION
     // =================================================
 
+    Serial.println();
     Serial.println(
-        "BLE: Looking for TX..."
+        "BLE: Registering notification callback..."
+    );
+
+    if (
+        rxCharacteristic->canNotify()
+    ) {
+
+        rxCharacteristic->registerForNotify(
+            notificationCallback
+        );
+
+        Serial.println(
+            "BLE: registerForNotify() called"
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "BLE ERROR: RX does NOT support NOTIFY"
+        );
+    }
+
+    delay(1000);
+
+    // =================================================
+    // TX CHARACTERISTIC
+    // =================================================
+
+    Serial.println();
+    Serial.println(
+        "BLE: Searching TX characteristic..."
     );
 
     txCharacteristic =
         service->getCharacteristic(
-            UART_TX_UUID
+            NUS_TX
         );
 
     if (
-        txCharacteristic == nullptr
+        txCharacteristic != nullptr
     ) {
 
         Serial.println(
-            "BLE ERROR: TX NOT FOUND"
+            "BLE: *** TX CHARACTERISTIC FOUND ***"
         );
 
-        cleanupBLEConnection();
+        Serial.print(
+            "BLE TX UUID: "
+        );
 
-        return false;
+        Serial.println(
+            txCharacteristic->getUUID()
+                .toString()
+                .c_str()
+        );
+
+    }
+    else {
+
+        Serial.println(
+            "BLE: TX characteristic not found"
+        );
+
+        Serial.println(
+            "BLE: This is OK for reception."
+        );
     }
 
-    Serial.println(
-        "BLE: TX characteristic FOUND"
-    );
+    // =================================================
+    // SAVE DEVICE INFORMATION
+    // =================================================
 
-    Serial.print(
-        "BLE: TX UUID: "
-    );
-
-    Serial.println(
-        txCharacteristic->getUUID()
+    connectedAddress =
+        device->getAddress()
             .toString()
-            .c_str()
-    );
-
-    // =================================================
-    // DO NOT REQUIRE canNotify()
-    // =================================================
+            .c_str();
 
     if (
-        txCharacteristic->canWrite()
+        device->haveName()
     ) {
 
-        Serial.println(
-            "BLE: TX supports WRITE"
-        );
+        connectedName =
+            device->getName()
+                .c_str();
+
     }
+    else {
 
-    if (
-        txCharacteristic->canWriteNoResponse()
-    ) {
-
-        Serial.println(
-            "BLE: TX supports WRITE NO RESPONSE"
-        );
+        connectedName =
+            "<unknown>";
     }
 
     // =================================================
-    // CONNECTION SUCCESS
+    // READY
     // =================================================
 
-    bleConnected = true;
+    bleConnected =
+        true;
+
+    rxBuffer =
+        "";
 
     Serial.println();
     Serial.println(
-        "================================"
+        "========================================"
     );
 
     Serial.println(
@@ -1065,101 +1075,124 @@ bool connectAndVerifyNUS(
         "BLE: *** NUS READY ***"
     );
 
-    Serial.println(
-        "BLE: *** CONNECTION WILL STAY OPEN ***"
+    Serial.print(
+        "BLE: NAME = "
     );
 
     Serial.println(
-        "================================"
+        connectedName
     );
 
-    delay(500);
+    Serial.print(
+        "BLE: ADDRESS = "
+    );
 
-    // =================================================
-    // TEST BEEP
-    // =================================================
+    Serial.println(
+        connectedAddress
+    );
 
-    sendConnectionBeep();
+    Serial.println(
+        "BLE: WAITING FOR SENSOR DATA..."
+    );
+
+    Serial.println(
+        "========================================"
+    );
 
     return true;
 }
 
 // =====================================================
-// FIND MICRO:BIT
+// CLEAN CONNECTION
 // =====================================================
 
-bool connectToMicrobit()
+void cleanupConnection()
 {
+
+    rxCharacteristic =
+        nullptr;
+
+    txCharacteristic =
+        nullptr;
+
+    bleConnected =
+        false;
+
+    rxBuffer =
+        "";
+
+    if (
+        client != nullptr
+    ) {
+
+        if (
+            client->isConnected()
+        ) {
+
+            Serial.println(
+                "BLE: Disconnecting old client..."
+            );
+
+            client->disconnect();
+
+            delay(200);
+        }
+
+        delete client;
+
+        client =
+            nullptr;
+    }
+}
+
+// =====================================================
+// SCAN AND CONNECT
+// =====================================================
+
+void scanAndConnect()
+{
+
     Serial.println();
     Serial.println(
         "================================"
     );
 
     Serial.println(
-        "BLE: AUTOMATIC MICRO:BIT SEARCH"
+        "BLE: SCANNING FOR MICRO:BIT"
     );
 
     Serial.println(
         "================================"
     );
 
-    Serial.println(
-        "Identification:"
-    );
-
-    Serial.println(
-        "  1. BLE name"
-    );
-
-    Serial.println(
-        "  2. Nordic UART Service"
-    );
-
-    Serial.println(
-        "  3. NUS RX/TX"
-    );
-
-    Serial.println(
-        "MAC address is NOT fixed"
-    );
-
-    // =================================================
-    // CLEAN OLD CLIENT
-    // =================================================
-
-    cleanupBLEConnection();
-
-    // =================================================
-    // SCANNER
-    // =================================================
-
-    BLEScan* scan =
+    BLEScan* scanner =
         BLEDevice::getScan();
 
     if (
-        scan == nullptr
+        scanner == nullptr
     ) {
 
         Serial.println(
             "BLE ERROR: Scanner unavailable"
         );
 
-        return false;
+        return;
     }
 
-    scan->setActiveScan(true);
+    scanner->setActiveScan(
+        true
+    );
 
-    scan->setInterval(100);
+    scanner->setInterval(
+        100
+    );
 
-    scan->setWindow(80);
-
-    Serial.println();
-    Serial.println(
-        "BLE: Scanning..."
+    scanner->setWindow(
+        80
     );
 
     BLEScanResults results =
-        scan->start(
+        scanner->start(
             8,
             false
         );
@@ -1171,20 +1204,9 @@ bool connectToMicrobit()
         "BLE: Devices found: "
     );
 
-    Serial.println(count);
-
-    if (
-        count <= 0
-    ) {
-
-        scan->clearResults();
-
-        return false;
-    }
-
-    // =================================================
-    // FIND MICRO:BIT
-    // =================================================
+    Serial.println(
+        count
+    );
 
     for (
         int i = 0;
@@ -1195,13 +1217,70 @@ bool connectToMicrobit()
         BLEAdvertisedDevice device =
             results.getDevice(i);
 
-        printBLEDevice(
-            device,
+        Serial.println();
+        Serial.println(
+            "--------------------------------"
+        );
+
+        Serial.print(
+            "DEVICE #"
+        );
+
+        Serial.println(
             i + 1
         );
 
+        Serial.print(
+            "Address: "
+        );
+
+        Serial.println(
+            device.getAddress()
+                .toString()
+                .c_str()
+        );
+
+        Serial.print(
+            "RSSI: "
+        );
+
+        Serial.print(
+            device.getRSSI()
+        );
+
+        Serial.println(
+            " dBm"
+        );
+
         if (
-            isMicrobitDevice(device)
+            device.haveName()
+        ) {
+
+            Serial.print(
+                "Name: "
+            );
+
+            Serial.println(
+                device.getName()
+                    .c_str()
+            );
+
+        }
+        else {
+
+            Serial.println(
+                "Name: <none>"
+            );
+        }
+
+        // =================================================
+        // CHECK MICRO:BIT
+        // =================================================
+
+        if (
+            isAllowedMicrobit(
+                device
+            )
         ) {
 
             Serial.println();
@@ -1209,293 +1288,41 @@ bool connectToMicrobit()
                 "BLE: *** MICRO:BIT CANDIDATE FOUND ***"
             );
 
-            Serial.print(
-                "BLE: Name: "
-            );
-
-            Serial.println(
-                device.getName().c_str()
-            );
-
-            Serial.print(
-                "BLE: Address: "
-            );
-
-            Serial.println(
-                device.getAddress()
-                    .toString()
-                    .c_str()
-            );
-
-            // Make a copy before clearing scan
             BLEAdvertisedDevice* candidate =
                 new BLEAdvertisedDevice(
                     device
                 );
 
-            scan->clearResults();
+            scanner->clearResults();
 
             bool success =
-                connectAndVerifyNUS(
+                connectToDevice(
                     candidate
                 );
 
             delete candidate;
 
-            if (success) {
+            if (
+                success
+            ) {
 
-                Serial.println();
-                Serial.println(
-                    "BLE: *** MICRO:BIT READY ***"
-                );
-
-                return true;
+                return;
             }
 
             Serial.println(
-                "BLE: Candidate failed"
+                "BLE: Candidate connection failed"
             );
 
-            return false;
+            return;
         }
     }
 
-    scan->clearResults();
+    scanner->clearResults();
 
     Serial.println();
     Serial.println(
-        "BLE: micro:bit not found"
+        "BLE: No allowed micro:bit found"
     );
-
-    return false;
-}
-
-// =====================================================
-// HTML
-// =====================================================
-
-String makeHTML()
-{
-    String html = R"rawliteral(
-<!DOCTYPE html>
-
-<html>
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta name="viewport"
-      content="width=device-width, initial-scale=1">
-
-<meta http-equiv="refresh" content="5">
-
-<title>ESP32 Environmental Monitor</title>
-
-<style>
-
-body {
-    font-family: Arial;
-    background: #111827;
-    color: white;
-    text-align: center;
-    margin: 0;
-    padding: 30px;
-}
-
-.container {
-    max-width: 700px;
-    margin: auto;
-}
-
-.card {
-    background: #1f2937;
-    border-radius: 15px;
-    padding: 30px;
-    margin: 20px;
-}
-
-.value {
-    font-size: 60px;
-    font-weight: bold;
-}
-
-.unit {
-    font-size: 25px;
-}
-
-.connected {
-    color: #22c55e;
-    font-weight: bold;
-}
-
-.disconnected {
-    color: #ef4444;
-    font-weight: bold;
-}
-
-.device {
-    word-break: break-all;
-}
-
-button {
-    padding: 15px 30px;
-    font-size: 18px;
-    border-radius: 10px;
-    border: none;
-    cursor: pointer;
-}
-
-</style>
-
-</head>
-
-<body>
-
-<div class="container">
-
-<h1>🌡️ ESP32 Environmental Monitor</h1>
-
-<div class="card">
-
-<h2>Temperature</h2>
-
-<div class="value">
-%TEMPERATURE%
-</div>
-
-<div class="unit">
-°C
-</div>
-
-</div>
-
-<div class="card">
-
-<h2>Humidity</h2>
-
-<div class="value">
-%HUMIDITY%
-</div>
-
-<div class="unit">
-%
-</div>
-
-</div>
-
-<div class="card">
-
-<h2>Status</h2>
-
-<p>
-Wi-Fi:
-%WIFI_STATUS%
-</p>
-
-<p>
-Bluetooth:
-%BLE_STATUS%
-</p>
-
-<p>
-Sensor:
-%DATA_STATUS%
-</p>
-
-</div>
-
-<div class="card">
-
-<h2>Micro:bit</h2>
-
-<p>
-%BLE_NAME%
-</p>
-
-<p class="device">
-%BLE_ADDRESS%
-</p>
-
-<br>
-
-<button onclick="location.href='/beep'">
-🔊 BEEP
-</button>
-
-</div>
-
-</div>
-
-</body>
-
-</html>
-
-)rawliteral";
-
-    html.replace(
-        "%TEMPERATURE%",
-        String(
-            temperature,
-            1
-        )
-    );
-
-    html.replace(
-        "%HUMIDITY%",
-        String(
-            humidity,
-            1
-        )
-    );
-
-    html.replace(
-        "%BLE_ADDRESS%",
-        microbitAddress
-    );
-
-    html.replace(
-        "%BLE_NAME%",
-        microbitName
-    );
-
-    String wifiStatus =
-        WiFi.status() == WL_CONNECTED
-        ? "<span class='connected'>CONNECTED</span>"
-        : "<span class='disconnected'>DISCONNECTED</span>";
-
-    html.replace(
-        "%WIFI_STATUS%",
-        wifiStatus
-    );
-
-    String bleStatus =
-        bleConnected
-        ? "<span class='connected'>CONNECTED</span>"
-        : "<span class='disconnected'>DISCONNECTED</span>";
-
-    html.replace(
-        "%BLE_STATUS%",
-        bleStatus
-    );
-
-    bool recent =
-        dataReceived &&
-        millis() -
-        lastTemperatureTime <
-        DATA_TIMEOUT;
-
-    String dataStatus =
-        recent
-        ? "<span class='connected'>RECEIVING</span>"
-        : "<span class='disconnected'>NO RECENT DATA</span>";
-
-    html.replace(
-        "%DATA_STATUS%",
-        dataStatus
-    );
-
-    return html;
 }
 
 // =====================================================
@@ -1504,10 +1331,199 @@ Sensor:
 
 void handleRoot()
 {
+
+    String html;
+
+    html +=
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' "
+        "content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv='refresh' content='3'>"
+        "<title>ESP32 Micro:bit Monitor</title>"
+
+        "<style>"
+
+        "body{"
+        "font-family:Arial;"
+        "background:#111827;"
+        "color:white;"
+        "text-align:center;"
+        "padding:30px;"
+        "}"
+
+        ".container{"
+        "max-width:700px;"
+        "margin:auto;"
+        "}"
+
+        ".card{"
+        "background:#1f2937;"
+        "padding:25px;"
+        "margin:15px;"
+        "border-radius:15px;"
+        "}"
+
+        ".value{"
+        "font-size:55px;"
+        "font-weight:bold;"
+        "}"
+
+        ".ok{"
+        "color:#22c55e;"
+        "font-weight:bold;"
+        "}"
+
+        ".bad{"
+        "color:#ef4444;"
+        "font-weight:bold;"
+        "}"
+
+        ".device{"
+        "font-size:18px;"
+        "word-break:break-all;"
+        "}"
+
+        "</style>"
+        "</head>"
+
+        "<body>"
+
+        "<div class='container'>"
+
+        "<h1>ESP32 + micro:bit</h1>";
+
+    // =================================================
+    // TEMPERATURE
+    // =================================================
+
+    html +=
+        "<div class='card'>"
+        "<h2>Temperature</h2>"
+        "<div class='value'>";
+
+    html +=
+        String(
+            temperature,
+            1
+        );
+
+    html +=
+        " &deg;C"
+        "</div>"
+        "</div>";
+
+    // =================================================
+    // HUMIDITY
+    // =================================================
+
+    html +=
+        "<div class='card'>"
+        "<h2>Humidity</h2>"
+        "<div class='value'>";
+
+    html +=
+        String(
+            humidity,
+            1
+        );
+
+    html +=
+        " %"
+        "</div>"
+        "</div>";
+
+    // =================================================
+    // BLE STATUS
+    // =================================================
+
+    html +=
+        "<div class='card'>"
+        "<h2>Bluetooth</h2>";
+
+    if (
+        bleConnected
+    ) {
+
+        html +=
+            "<p class='ok'>CONNECTED</p>";
+
+        html +=
+            "<p class='device'>";
+
+        html +=
+            connectedName;
+
+        html +=
+            "</p>";
+
+        html +=
+            "<p class='device'>";
+
+        html +=
+            connectedAddress;
+
+        html +=
+            "</p>";
+
+    }
+    else {
+
+        html +=
+            "<p class='bad'>DISCONNECTED</p>";
+    }
+
+    html +=
+        "</div>";
+
+    // =================================================
+    // DATA STATUS
+    // =================================================
+
+    html +=
+        "<div class='card'>"
+        "<h2>Sensor</h2>";
+
+    bool recentData =
+        dataReceived &&
+        (
+            millis() -
+            lastDataTime <
+            DATA_TIMEOUT
+        );
+
+    if (
+        recentData
+    ) {
+
+        html +=
+            "<p class='ok'>DATA RECEIVING</p>";
+
+    }
+    else {
+
+        html +=
+            "<p class='bad'>NO RECENT DATA</p>";
+    }
+
+    html +=
+        "</div>";
+
+    // =================================================
+    // END
+    // =================================================
+
+    html +=
+        "</div>"
+        "</body>"
+        "</html>";
+
     server.send(
         200,
         "text/html",
-        makeHTML()
+        html
     );
 }
 
@@ -1515,47 +1531,59 @@ void handleRoot()
 // API
 // =====================================================
 
-void handleAPIData()
+void handleAPI()
 {
+
     String json = "{";
 
-    json += "\"temperature\":";
-    json += String(
-        temperature,
-        1
-    );
-
-    json += ",";
-
-    json += "\"humidity\":";
-    json += String(
-        humidity,
-        1
-    );
-
-    json += ",";
-
-    json += "\"wifi\":";
     json +=
-        WiFi.status() == WL_CONNECTED
+        "\"temperature\":";
+
+    json +=
+        String(
+            temperature,
+            1
+        );
+
+    json +=
+        ",\"humidity\":";
+
+    json +=
+        String(
+            humidity,
+            1
+        );
+
+    json +=
+        ",\"dataReceived\":";
+
+    json +=
+        dataReceived
         ? "true"
         : "false";
 
-    json += ",";
+    json +=
+        ",\"ble\":";
 
-    json += "\"ble\":";
     json +=
         bleConnected
         ? "true"
         : "false";
 
-    json += ",";
+    json +=
+        ",\"name\":\"";
 
-    json += "\"address\":\"";
-    json += microbitAddress;
-    json += "\"";
+    json +=
+        connectedName;
 
-    json += "}";
+    json +=
+        "\",\"address\":\"";
+
+    json +=
+        connectedAddress;
+
+    json +=
+        "\"}";
 
     server.send(
         200,
@@ -1570,127 +1598,94 @@ void handleAPIData()
 
 void handleStatus()
 {
-    String status;
 
-    status +=
-        "ESP32 ENVIRONMENTAL MONITOR\n";
+    String text;
 
-    status +=
-        "============================\n";
+    text +=
+        "ESP32 + MICRO:BIT NUS RECEIVER\n";
 
-    status +=
+    text +=
+        "================================\n";
+
+    text +=
         "WiFi: ";
 
-    status +=
+    text +=
         WiFi.status() == WL_CONNECTED
         ? "CONNECTED\n"
         : "DISCONNECTED\n";
 
-    status +=
+    text +=
         "IP: ";
 
-    status +=
+    text +=
         WiFi.localIP().toString();
 
-    status +=
-        "\n";
+    text +=
+        "\n\n";
 
-    status +=
+    text +=
         "BLE: ";
 
-    status +=
+    text +=
         bleConnected
         ? "CONNECTED\n"
         : "DISCONNECTED\n";
 
-    status +=
-        "Micro:bit: ";
+    text +=
+        "Name: ";
 
-    status +=
-        microbitName;
+    text +=
+        connectedName;
 
-    status +=
-        "\nAddress: ";
+    text +=
+        "\n";
 
-    status +=
-        microbitAddress;
+    text +=
+        "Address: ";
 
-    status +=
-        "\nTemperature: ";
+    text +=
+        connectedAddress;
 
-    status +=
+    text +=
+        "\n\n";
+
+    text +=
+        "Temperature: ";
+
+    text +=
         String(
             temperature,
             1
         );
 
-    status +=
-        " C\nHumidity: ";
+    text +=
+        " C\n";
 
-    status +=
+    text +=
+        "Humidity: ";
+
+    text +=
         String(
             humidity,
             1
         );
 
-    status +=
+    text +=
         " %\n";
+
+    text +=
+        "Data received: ";
+
+    text +=
+        dataReceived
+        ? "YES\n"
+        : "NO\n";
 
     server.send(
         200,
         "text/plain",
-        status
-    );
-}
-
-// =====================================================
-// BEEP
-// =====================================================
-
-void handleBeep()
-{
-    if (!bleConnected) {
-
-        server.send(
-            503,
-            "text/plain",
-            "Micro:bit is disconnected"
-        );
-
-        return;
-    }
-
-    if (
-        sendConnectionBeep()
-    ) {
-
-        server.send(
-            200,
-            "text/plain",
-            "BEEP sent"
-        );
-
-    }
-    else {
-
-        server.send(
-            500,
-            "text/plain",
-            "BEEP failed"
-        );
-    }
-}
-
-// =====================================================
-// FAVICON
-// =====================================================
-
-void handleFavicon()
-{
-    server.send(
-        204,
-        "text/plain",
-        ""
+        text
     );
 }
 
@@ -1700,6 +1695,7 @@ void handleFavicon()
 
 void setup()
 {
+
     Serial.begin(
         115200
     );
@@ -1712,11 +1708,11 @@ void setup()
     );
 
     Serial.println(
-        "ESP32 + MICRO:BIT ENVIRONMENT MONITOR"
+        "ESP32 MICRO:BIT TEMPERATURE RECEIVER"
     );
 
     Serial.println(
-        "LONG-LIVED BLE NUS CONNECTION"
+        "NORDIC UART SERVICE"
     );
 
     Serial.println(
@@ -1732,20 +1728,20 @@ void setup()
     );
 
     WiFi.begin(
-        ssid,
-        password
+        WIFI_SSID,
+        WIFI_PASSWORD
     );
 
     Serial.print(
-        "WIFI: Connecting"
+        "WiFi connecting"
     );
 
-    unsigned long start =
+    unsigned long wifiStart =
         millis();
 
     while (
         WiFi.status() != WL_CONNECTED &&
-        millis() - start < 20000
+        millis() - wifiStart < 20000
     ) {
 
         delay(500);
@@ -1760,11 +1756,11 @@ void setup()
     ) {
 
         Serial.println(
-            "WIFI: CONNECTED"
+            "WiFi: CONNECTED"
         );
 
         Serial.print(
-            "WIFI IP: "
+            "WiFi IP: "
         );
 
         Serial.println(
@@ -1775,7 +1771,7 @@ void setup()
     else {
 
         Serial.println(
-            "WIFI: FAILED"
+            "WiFi: CONNECTION FAILED"
         );
     }
 
@@ -1789,8 +1785,8 @@ void setup()
     );
 
     server.on(
-        "/api/data",
-        handleAPIData
+        "/api",
+        handleAPI
     );
 
     server.on(
@@ -1798,20 +1794,10 @@ void setup()
         handleStatus
     );
 
-    server.on(
-        "/beep",
-        handleBeep
-    );
-
-    server.on(
-        "/favicon.ico",
-        handleFavicon
-    );
-
     server.begin();
 
     Serial.println(
-        "WEB: Server started"
+        "Web server: STARTED"
     );
 
     // =================================================
@@ -1831,29 +1817,10 @@ void setup()
     );
 
     // =================================================
-    // FIRST CONNECTION
+    // INITIAL CONNECTION
     // =================================================
 
-    if (
-        connectToMicrobit()
-    ) {
-
-        Serial.println();
-        Serial.println(
-            "SYSTEM: *** BLE CONNECTED ***"
-        );
-
-    }
-    else {
-
-        Serial.println();
-        Serial.println(
-            "SYSTEM: BLE connection failed"
-        );
-
-        lastBLERetry =
-            millis();
-    }
+    scanAndConnect();
 
     Serial.println();
     Serial.println(
@@ -1875,6 +1842,7 @@ void setup()
 
 void loop()
 {
+
     // =================================================
     // WEB SERVER
     // =================================================
@@ -1882,57 +1850,16 @@ void loop()
     server.handleClient();
 
     // =================================================
-    // WIFI
-    // =================================================
-
-    static bool lastWifiState =
-        false;
-
-    bool currentWifiState =
-        WiFi.status() == WL_CONNECTED;
-
-    if (
-        currentWifiState !=
-        lastWifiState
-    ) {
-
-        if (currentWifiState) {
-
-            Serial.println(
-                "WIFI: CONNECTED"
-            );
-
-            Serial.print(
-                "IP: "
-            );
-
-            Serial.println(
-                WiFi.localIP()
-            );
-
-        }
-        else {
-
-            Serial.println(
-                "WIFI: DISCONNECTED"
-            );
-        }
-
-        lastWifiState =
-            currentWifiState;
-    }
-
-    // =================================================
-    // BLE CONNECTION
+    // CHECK BLE CONNECTION
     // =================================================
 
     if (
-        bleClient != nullptr &&
-        bleConnected
+        bleConnected &&
+        client != nullptr
     ) {
 
         if (
-            !bleClient->isConnected()
+            !client->isConnected()
         ) {
 
             Serial.println();
@@ -1949,17 +1876,16 @@ void loop()
             txCharacteristic =
                 nullptr;
 
-            lastBLERetry =
+            rxBuffer =
+                "";
+
+            lastReconnect =
                 millis();
         }
     }
 
     // =================================================
-    // IMPORTANT:
-    //
-    // DO NOT SCAN WHILE CONNECTED.
-    //
-    // This is what helps keep the connection alive.
+    // AUTOMATIC RECONNECT
     // =================================================
 
     if (
@@ -1968,11 +1894,11 @@ void loop()
 
         if (
             millis() -
-            lastBLERetry >=
-            BLE_RETRY_INTERVAL
+            lastReconnect >=
+            RECONNECT_INTERVAL
         ) {
 
-            lastBLERetry =
+            lastReconnect =
                 millis();
 
             Serial.println();
@@ -1980,8 +1906,10 @@ void loop()
                 "BLE: Automatic reconnect..."
             );
 
+            scanAndConnect();
+
             if (
-                connectToMicrobit()
+                bleConnected
             ) {
 
                 Serial.println();
@@ -2000,42 +1928,38 @@ void loop()
     }
 
     // =================================================
-    // SENSOR TIMEOUT
+    // SENSOR DATA TIMEOUT
     // =================================================
 
-    static bool timeoutPrinted =
+    static bool timeoutMessage =
         false;
 
     if (
         dataReceived &&
         millis() -
-        lastTemperatureTime >
+        lastDataTime >
         DATA_TIMEOUT
     ) {
 
         if (
-            !timeoutPrinted
+            !timeoutMessage
         ) {
 
             Serial.println();
             Serial.println(
-                "SENSOR: No data for 10 seconds"
+                "WARNING: No sensor data received for 10 seconds"
             );
 
-            timeoutPrinted =
+            timeoutMessage =
                 true;
         }
 
     }
     else {
 
-        timeoutPrinted =
+        timeoutMessage =
             false;
     }
-
-    // =================================================
-    // DO NOT USE A LARGE DELAY
-    // =================================================
 
     delay(5);
 }

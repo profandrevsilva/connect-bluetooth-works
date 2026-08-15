@@ -1,26 +1,31 @@
 bluetooth.onBluetoothConnected(function () {
-    basic.showIcon(IconNames.Yes)
+    connected = true
+    basic.showIcon(IconNames.SmallHeart)
 })
 bluetooth.onBluetoothDisconnected(function () {
+    connected = false
     basic.showIcon(IconNames.No)
 })
-bluetooth.onUartDataReceived(serial.delimiters(Delimiters.NewLine), function () {
-    robotbit.Servo(robotbit.Servos.S1, 90)
-    command = bluetooth.uartReadUntil(serial.delimiters(Delimiters.NewLine))
-    if (command == "right") {
-        basic.pause(1000)
-        robotbit.Servo(robotbit.Servos.S1, 0)
-        basic.pause(1000)
-        robotbit.Servo(robotbit.Servos.S1, 90)
-    } else if (command == "left") {
-        basic.pause(1000)
-        robotbit.Servo(robotbit.Servos.S1, 180)
-        basic.pause(1000)
-        robotbit.Servo(robotbit.Servos.S1, 90)
-    } else if (command == "horn") {
-        music.play(music.stringPlayable("C5 B A G F E D C ", 140), music.PlaybackMode.InBackground)
+let temperature = 0
+let connected = false
+bluetooth.startUartService()
+basic.showIcon(IconNames.Yes)
+basic.pause(1000)
+basic.forever(function () {
+    if (connected) {
+        // ==========================================
+        // MICRO:BIT INTERNAL TEMPERATURE SENSOR
+        // ==========================================
+        temperature = input.temperature()
+        // ==========================================
+        // SEND TO ESP32
+        // ==========================================
+        bluetooth.uartWriteLine("TEMP:" + temperature)
+        // Display temperature
+        basic.showNumber(temperature)
+        // Send every 2 seconds
+        basic.pause(2000)
+    } else {
+        basic.pause(500)
     }
 })
-let command = ""
-bluetooth.startUartService()
-basic.showIcon(IconNames.Heart)
