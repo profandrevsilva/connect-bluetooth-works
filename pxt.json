@@ -1,0 +1,40 @@
+{
+    "name": "Connect bluetooth WORKS",
+    "description": "Bluetooth connection test",
+    "dependencies": {
+        "core": "*",
+        "bluetooth": "*",
+        "microphone": "*",
+        "servo": "*",
+        "ContinuousServo": "github:tinkertanker/pxt-continuous-servo#v0.0.6",
+        "robotbit": "github:kittenbot/pxt-robotbit#v0.4.8"
+    },
+    "files": [
+        "main.blocks",
+        "main.ts",
+        "README.md"
+    ],
+    "testFiles": [
+        "test.ts"
+    ],
+    "targetVersions": {
+        "target": "9.0.8",
+        "targetId": "microbit"
+    },
+    "supportedTargets": [
+        "microbit"
+    ],
+    "preferredEditor": "blocksprj",
+    "yotta": {
+        "config": {
+            "microbit-dal": {
+                "bluetooth": {
+                    "open": 1,
+                    "pairing_mode": 0,
+                    "whitelist": 0,
+                    "security_level": null
+                }
+            }
+        }
+    }
+}
